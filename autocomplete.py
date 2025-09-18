@@ -66,12 +66,37 @@ class AutocompleteConsole:
         """Get next word predictions based on the last k words before cursor."""
         # Get text up to cursor
         text_before = self.text[:self.cursor_pos]
+        
+        # Check if we're in the middle of typing a word
+        partial_word = ""
+        if text_before and not text_before.endswith(' '):
+            # Split and get the partial word being typed
+            parts = text_before.rsplit(' ', 1)
+            if len(parts) > 1:
+                text_before = parts[0] + ' '  # Everything before the partial word
+                partial_word = parts[1].lower()
+            else:
+                # Only partial word typed, no complete words yet
+                partial_word = parts[0].lower()
+                text_before = ""
+        
         words = text_before.lower().split()
+        
+        # If we have a partial word but not enough context, try to complete from vocabulary
+        if partial_word and len(words) < self.k:
+            # Return words from vocabulary that start with the partial word
+            suggestions = []
+            for word in self.vocab_loader.word_to_idx:
+                if word.startswith(partial_word) and word != partial_word and word not in ['<PAD>', '<UNK>']:
+                    suggestions.append(word)
+            # Sort alphabetically and return top 5
+            suggestions.sort()
+            return suggestions[:5]
         
         if len(words) < self.k:
             return []
         
-        # Get last k words
+        # Get last k words for context
         context_words = words[-self.k:]
         
         # Convert to indices
@@ -79,7 +104,7 @@ class AutocompleteConsole:
         
         # Get predictions
         with torch.no_grad():
-            predictions = self.model.most_likely_next_words(context_indices, top_n=10)
+            predictions = self.model.most_likely_next_words(context_indices, top_n=20)  # Get more to filter
         
         # Filter and return words with probabilities, sorted by probability
         word_predictions = []
@@ -87,7 +112,12 @@ class AutocompleteConsole:
             if idx < len(self.vocab_loader.idx_to_word):
                 word = self.vocab_loader.idx_to_word[idx]
                 if word not in ['<PAD>', '<UNK>']:
-                    word_predictions.append((word, prob))
+                    # If we have a partial word, filter by prefix
+                    if partial_word:
+                        if word.startswith(partial_word):
+                            word_predictions.append((word, prob))
+                    else:
+                        word_predictions.append((word, prob))
         
         # Sort by probability (highest first) and return top 5
         word_predictions.sort(key=lambda x: x[1], reverse=True)
@@ -128,11 +158,46 @@ class AutocompleteConsole:
         
         sys.stdout.flush()
     
+    def _complete_suggestion(self, index):
+        """Complete the current partial word with the suggestion at given index."""
+        if not self.suggestions or index >= len(self.suggestions):
+            return
+        
+        selected_word = self.suggestions[index]
+        text_before = self.text[:self.cursor_pos]
+        
+        # Check if we're completing a partial word
+        if text_before and not text_before.endswith(' '):
+            # Replace partial word with the suggestion
+            parts = text_before.rsplit(' ', 1)
+            if len(parts) > 1:
+                # Has words before the partial
+                self.text = parts[0] + ' ' + selected_word + ' ' + self.text[self.cursor_pos:]
+                self.cursor_pos = len(parts[0]) + len(selected_word) + 2
+            else:
+                # Only the partial word
+                self.text = selected_word + ' ' + self.text[self.cursor_pos:]
+                self.cursor_pos = len(selected_word) + 1
+        else:
+            # Add as new word
+            if text_before and not text_before.endswith(' '):
+                selected_word = ' ' + selected_word
+            self.text = self.text[:self.cursor_pos] + selected_word + ' ' + self.text[self.cursor_pos:]
+            self.cursor_pos += len(selected_word) + 1
+        
+        # Update suggestions and return focus to text
+        self.focus_on_suggestions = False
+        self.suggestions = self._get_predictions()
+        self.selected_index = 0
+    
     def _handle_key(self, key):
         """Handle keyboard input."""
-        if key == '\t':  # Tab - cycle through suggestions
+        if key == '\t':  # Tab - auto-complete if single suggestion, else cycle
             if self.suggestions:
-                if not self.focus_on_suggestions:
+                if len(self.suggestions) == 1:
+                    # Only one suggestion - auto-complete it
+                    self._complete_suggestion(0)
+                elif not self.focus_on_suggestions:
                     # First Tab - focus on suggestions
                     self.focus_on_suggestions = True
                     self.selected_index = 0
@@ -145,21 +210,8 @@ class AutocompleteConsole:
         
         elif key == '\r' or key == '\n':  # Enter - accept suggestion or newline
             if self.focus_on_suggestions and self.suggestions:
-                # Insert selected suggestion
-                selected_word = self.suggestions[self.selected_index]
-                
-                # Add space before if needed
-                if self.cursor_pos > 0 and self.text[self.cursor_pos-1] != ' ':
-                    selected_word = ' ' + selected_word
-                
-                # Insert at cursor
-                self.text = self.text[:self.cursor_pos] + selected_word + ' ' + self.text[self.cursor_pos:]
-                self.cursor_pos += len(selected_word) + 1
-                
-                # Update suggestions and return focus to text
-                self.focus_on_suggestions = False
-                self.suggestions = self._get_predictions()
-                self.selected_index = 0
+                # Use the completion helper
+                self._complete_suggestion(self.selected_index)
             else:
                 # Print current line and start new one
                 print(self.text)
@@ -224,7 +276,8 @@ class AutocompleteConsole:
         print("="*60)
         print(f"Commands:")
         print(f"  Type {self.k}+ words to see suggestions (always shown)")
-        print(f"  TAB     - Cycle through suggestions")
+        print(f"  Partial words filter suggestions by prefix")
+        print(f"  TAB     - Auto-complete if 1 match, else cycle")
         print(f"  ARROWS  - Navigate suggestions when focused")
         print(f"  ENTER   - Accept highlighted suggestion")
         print(f"  ESC     - Return focus to text")
