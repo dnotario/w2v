@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Simple autocomplete console using the improved model.
-Shows predictions above the cursor as you type.
+Interactive autocomplete console using the improved model.
+Shows predictions ahead of cursor, Tab to cycle, Enter to select, Esc to cancel.
 """
 
 import os
 import sys
 import torch
 import glob
+import termios
+import tty
+import select
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -15,11 +18,17 @@ from models.model import ImprovedKWordsToNext
 from scripts.train import ImprovedKWordsDataset
 
 
-class SimpleAutocomplete:
-    def __init__(self, checkpoint_path=None, k=3):
-        self.k = k
+class AutocompleteConsole:
+    def __init__(self, checkpoint_path=None):
         self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
         self._load_model(checkpoint_path)
+        
+        # Console state
+        self.text = ""
+        self.cursor_pos = 0
+        self.suggestions = []
+        self.selected_index = 0
+        self.showing_suggestions = False
         
     def _load_model(self, checkpoint_path=None):
         """Load the trained model from checkpoint."""
@@ -27,10 +36,8 @@ class SimpleAutocomplete:
         
         # Find latest checkpoint if not specified
         if checkpoint_path is None:
-            # Look for improved model checkpoints first
             checkpoints = glob.glob('checkpoints/improved_*.pt')
             if not checkpoints:
-                # Fallback to any checkpoint
                 checkpoints = glob.glob('checkpoints/*.pt')
             
             if not checkpoints:
@@ -38,11 +45,7 @@ class SimpleAutocomplete:
                 print("  python scripts/train.py --k 3 --epochs 1")
                 sys.exit(1)
             
-            # Use best model if available, otherwise latest
-            if 'checkpoints/improved_best.pt' in checkpoints:
-                checkpoint_path = 'checkpoints/improved_best.pt'
-            else:
-                checkpoint_path = sorted(checkpoints)[-1]
+            checkpoint_path = 'checkpoints/improved_best.pt' if 'checkpoints/improved_best.pt' in checkpoints else sorted(checkpoints)[-1]
         
         print(f"Loading checkpoint: {checkpoint_path}")
         
@@ -74,12 +77,14 @@ class SimpleAutocomplete:
         print(f"Model loaded (Epoch {checkpoint['epoch']}, Loss {checkpoint['loss']:.4f})")
         print("-" * 60)
     
-    def _get_predictions(self, text):
-        """Get next word predictions based on the last k words."""
-        words = text.lower().split()
+    def _get_predictions(self):
+        """Get next word predictions based on the last k words before cursor."""
+        # Get text up to cursor
+        text_before = self.text[:self.cursor_pos]
+        words = text_before.lower().split()
         
         if len(words) < self.k:
-            return None
+            return []
         
         # Get last k words
         context_words = words[-self.k:]
@@ -96,46 +101,161 @@ class SimpleAutocomplete:
         with torch.no_grad():
             predictions = self.model.most_likely_next_words(context_indices, top_n=10)
         
-        # Format predictions
+        # Filter and return words only
         word_predictions = []
         for idx, prob in predictions:
             if idx < len(self.dataset.idx_to_word):
                 word = self.dataset.idx_to_word[idx]
                 if word not in ['<PAD>', '<UNK>']:
-                    word_predictions.append(f"{word}({prob:.2f})")
+                    word_predictions.append(word)
         
-        return word_predictions[:5] if word_predictions else None
+        return word_predictions[:5]
+    
+    def _display(self):
+        """Display the current text with suggestions ahead of cursor."""
+        # Clear line
+        sys.stdout.write('\r' + ' ' * 120 + '\r')
+        
+        # Display text with cursor
+        before = self.text[:self.cursor_pos]
+        after = self.text[self.cursor_pos:]
+        
+        sys.stdout.write(before)
+        
+        # Show suggestions if available
+        if self.showing_suggestions and self.suggestions:
+            suggestion_str = ' ['
+            for i, word in enumerate(self.suggestions):
+                if i == self.selected_index:
+                    suggestion_str += f' ▶{word} '
+                else:
+                    suggestion_str += f' {word} '
+            suggestion_str += ']'
+            
+            # Show in gray color
+            sys.stdout.write('\033[90m' + suggestion_str + '\033[0m')
+        
+        sys.stdout.write(after)
+        
+        # Move cursor back to position
+        if len(after) > 0:
+            sys.stdout.write('\033[' + str(len(after)) + 'D')
+        
+        sys.stdout.flush()
+    
+    def _handle_key(self, key):
+        """Handle keyboard input."""
+        if key == '\t':  # Tab - show/cycle suggestions
+            if not self.showing_suggestions:
+                self.suggestions = self._get_predictions()
+                if self.suggestions:
+                    self.showing_suggestions = True
+                    self.selected_index = 0
+            else:
+                # Cycle through suggestions
+                self.selected_index = (self.selected_index + 1) % len(self.suggestions)
+        
+        elif key == '\r' or key == '\n':  # Enter - accept suggestion or newline
+            if self.showing_suggestions and self.suggestions:
+                # Insert selected suggestion
+                selected_word = self.suggestions[self.selected_index]
+                
+                # Add space before if needed
+                if self.cursor_pos > 0 and self.text[self.cursor_pos-1] != ' ':
+                    selected_word = ' ' + selected_word
+                
+                # Insert at cursor
+                self.text = self.text[:self.cursor_pos] + selected_word + ' ' + self.text[self.cursor_pos:]
+                self.cursor_pos += len(selected_word) + 1
+                
+                # Hide suggestions
+                self.showing_suggestions = False
+                self.suggestions = []
+                self.selected_index = 0
+            else:
+                # Print current line and start new one
+                print(self.text)
+                self.text = ""
+                self.cursor_pos = 0
+                self.showing_suggestions = False
+        
+        elif key == '\x1b':  # Escape - cancel suggestions
+            self.showing_suggestions = False
+            self.selected_index = 0
+        
+        elif key == '\x7f':  # Backspace
+            if self.cursor_pos > 0:
+                self.text = self.text[:self.cursor_pos-1] + self.text[self.cursor_pos:]
+                self.cursor_pos -= 1
+                self.showing_suggestions = False
+        
+        elif key == '\x1b[D':  # Left arrow
+            if self.cursor_pos > 0:
+                self.cursor_pos -= 1
+                self.showing_suggestions = False
+        
+        elif key == '\x1b[C':  # Right arrow
+            if self.cursor_pos < len(self.text):
+                self.cursor_pos += 1
+                self.showing_suggestions = False
+        
+        elif key == '\x03':  # Ctrl+C
+            return False
+        
+        elif len(key) == 1 and key.isprintable():
+            # Regular character
+            self.text = self.text[:self.cursor_pos] + key + self.text[self.cursor_pos:]
+            self.cursor_pos += 1
+            
+            # Auto-show suggestions after space
+            if key == ' ':
+                self.suggestions = self._get_predictions()
+                if self.suggestions:
+                    self.showing_suggestions = True
+                    self.selected_index = 0
+            else:
+                self.showing_suggestions = False
+        
+        return True
     
     def run(self):
         """Run the interactive console."""
         print("\n" + "="*60)
         print("WORD2VEC AUTOCOMPLETE")
         print("="*60)
-        print(f"Type text and see predictions (needs {self.k} words for context)")
-        print("Type 'quit' or Ctrl+C to exit")
+        print(f"Commands:")
+        print(f"  Type {self.k}+ words then SPACE to see suggestions")
+        print(f"  TAB     - Show/cycle through suggestions")
+        print(f"  ENTER   - Accept selected suggestion")
+        print(f"  ESC     - Cancel suggestions")
+        print(f"  Ctrl+C  - Exit")
         print("-"*60)
-        print()
+        print("\nStart typing:\n")
+        
+        # Setup terminal
+        old_settings = termios.tcgetattr(sys.stdin)
         
         try:
+            tty.setraw(sys.stdin.fileno())
+            
             while True:
-                text = input(">>> ")
+                self._display()
                 
-                if text.lower() == 'quit':
+                # Read key
+                key = sys.stdin.read(1)
+                
+                # Handle escape sequences
+                if key == '\x1b':
+                    # Check if more characters are available
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        key += sys.stdin.read(2)
+                
+                if not self._handle_key(key):
                     break
-                    
-                if not text.strip():
-                    continue
-                
-                # Get and display predictions
-                predictions = self._get_predictions(text)
-                
-                if predictions:
-                    print(f"Next: {' | '.join(predictions)}")
-                else:
-                    print(f"Next: (need {self.k} words for context)")
-                print()
-                
-        except (KeyboardInterrupt, EOFError):
+        
+        finally:
+            # Restore terminal
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             print("\n\nGoodbye!")
 
 
@@ -148,7 +268,7 @@ def main():
     
     args = parser.parse_args()
     
-    console = SimpleAutocomplete(checkpoint_path=args.checkpoint)
+    console = AutocompleteConsole(checkpoint_path=args.checkpoint)
     console.run()
 
 
