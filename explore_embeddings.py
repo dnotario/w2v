@@ -13,7 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.model import ImprovedKWordsToNext
-from scripts.train import ImprovedKWordsDataset
+from vocabulary_loader import VocabularyLoader
 
 
 class EmbeddingExplorer:
@@ -27,44 +27,29 @@ class EmbeddingExplorer:
         
         # Find checkpoint
         if checkpoint_path is None:
-            checkpoints = glob.glob('checkpoints/improved_*.pt')
-            if not checkpoints:
-                print("No checkpoints found! Train a model first:")
-                print("  python scripts/train.py --k 3 --epochs 3")
-                sys.exit(1)
-            
-            checkpoint_path = 'checkpoints/improved_best.pt' if 'checkpoints/improved_best.pt' in checkpoints else sorted(checkpoints)[-1]
+            if os.path.exists('checkpoints/k_words.pt'):
+                checkpoint_path = 'checkpoints/k_words.pt'
+            else:
+                checkpoints = glob.glob('checkpoints/*.pt')
+                if not checkpoints:
+                    print("No checkpoints found! Train a model first:")
+                    print("  python scripts/train.py --k 3 --epochs 3")
+                    sys.exit(1)
+                checkpoint_path = sorted(checkpoints)[-1]
         
         print(f"Loading checkpoint: {checkpoint_path}")
         
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        args = checkpoint['args']
-        
-        # Create dataset for vocabulary
+        # Load vocabulary (fast!)
         print("Loading vocabulary...")
-        self.dataset = ImprovedKWordsDataset(
-            vocab_size=args.vocab_size,
-            min_count=args.min_count,
-            k=args.k
-        )
+        self.vocab_loader = VocabularyLoader()
         
-        # Create and load model
-        self.model = ImprovedKWordsToNext(
-            vocab_size=self.dataset.vocab_size,
-            k=args.k,
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            dropout=args.dropout
-        ).to(self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
+        # Load model
+        self.model, self.device = self.vocab_loader.load_model(checkpoint_path, self.device)
         
         # Extract embeddings (average of all position embeddings)
         self._extract_embeddings()
         
-        print(f"Model loaded: {self.dataset.vocab_size} words, {args.embedding_dim}-dim embeddings")
+        print(f"Model loaded: {self.vocab_loader.vocab_size} words, {self.vocab_loader.embedding_dim}-dim embeddings")
         print("-" * 60)
     
     def _extract_embeddings(self):
@@ -82,17 +67,17 @@ class EmbeddingExplorer:
     
     def word_to_vec(self, word):
         """Get embedding vector for a word."""
-        if word not in self.dataset.word_to_idx:
+        if word not in self.vocab_loader.word_to_idx:
             return None
-        idx = self.dataset.word_to_idx[word]
+        idx = self.vocab_loader.word_to_idx[word]
         return self.embeddings[idx]
     
     def most_similar(self, word, top_n=10):
         """Find most similar words."""
-        if word not in self.dataset.word_to_idx:
+        if word not in self.vocab_loader.word_to_idx:
             return []
         
-        idx = self.dataset.word_to_idx[word]
+        idx = self.vocab_loader.word_to_idx[word]
         word_vec = self.embeddings_norm[idx]
         
         # Compute similarities
@@ -103,18 +88,18 @@ class EmbeddingExplorer:
         
         results = []
         for val, idx in zip(values.tolist(), indices.tolist()):
-            if idx != self.dataset.word_to_idx[word]:
-                results.append((self.dataset.idx_to_word[idx], val))
+            if idx != self.vocab_loader.word_to_idx[word]:
+                results.append((self.vocab_loader.idx_to_word[idx], val))
         
         return results[:top_n]
     
     def similarity(self, word1, word2):
         """Compute similarity between two words."""
-        if word1 not in self.dataset.word_to_idx or word2 not in self.dataset.word_to_idx:
+        if word1 not in self.vocab_loader.word_to_idx or word2 not in self.vocab_loader.word_to_idx:
             return None
         
-        idx1 = self.dataset.word_to_idx[word1]
-        idx2 = self.dataset.word_to_idx[word2]
+        idx1 = self.vocab_loader.word_to_idx[word1]
+        idx2 = self.vocab_loader.word_to_idx[word2]
         
         vec1 = self.embeddings_norm[idx1]
         vec2 = self.embeddings_norm[idx2]
@@ -126,13 +111,13 @@ class EmbeddingExplorer:
         Solve analogy: word1 is to word2 as word3 is to ?
         Example: king - man + woman = queen
         """
-        if any(w not in self.dataset.word_to_idx for w in [word1, word2, word3]):
+        if any(w not in self.vocab_loader.word_to_idx for w in [word1, word2, word3]):
             return []
         
         # Get vectors
-        vec1 = self.embeddings[self.dataset.word_to_idx[word1]]
-        vec2 = self.embeddings[self.dataset.word_to_idx[word2]]
-        vec3 = self.embeddings[self.dataset.word_to_idx[word3]]
+        vec1 = self.embeddings[self.vocab_loader.word_to_idx[word1]]
+        vec2 = self.embeddings[self.vocab_loader.word_to_idx[word2]]
+        vec3 = self.embeddings[self.vocab_loader.word_to_idx[word3]]
         
         # Compute target: vec2 - vec1 + vec3
         target = vec2 - vec1 + vec3
@@ -146,7 +131,7 @@ class EmbeddingExplorer:
         input_words = {word1, word2, word3}
         results = []
         for val, idx in zip(values.tolist(), indices.tolist()):
-            word = self.dataset.idx_to_word[idx]
+            word = self.vocab_loader.idx_to_word[idx]
             if word not in input_words:
                 results.append((word, val))
         
@@ -161,14 +146,14 @@ class EmbeddingExplorer:
         result = torch.zeros_like(self.embeddings[0])
         
         for word in positive_words:
-            if word in self.dataset.word_to_idx:
-                idx = self.dataset.word_to_idx[word]
+            if word in self.vocab_loader.word_to_idx:
+                idx = self.vocab_loader.word_to_idx[word]
                 result += self.embeddings[idx]
         
         # Subtract negative vectors
         for word in negative_words:
-            if word in self.dataset.word_to_idx:
-                idx = self.dataset.word_to_idx[word]
+            if word in self.vocab_loader.word_to_idx:
+                idx = self.vocab_loader.word_to_idx[word]
                 result -= self.embeddings[idx]
         
         # Normalize and find similar
@@ -180,7 +165,7 @@ class EmbeddingExplorer:
         input_words = set(positive_words + negative_words)
         results = []
         for val, idx in zip(values.tolist(), indices.tolist()):
-            word = self.dataset.idx_to_word[idx]
+            word = self.vocab_loader.idx_to_word[idx]
             if word not in input_words:
                 results.append((word, val))
         

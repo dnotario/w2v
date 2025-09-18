@@ -291,7 +291,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
                 'args': args
-            }, os.path.join(args.checkpoint_dir, 'improved_best.pt'))
+            }, os.path.join(args.checkpoint_dir, 'k_words.pt'))
         
         # Evaluate
         if epoch % max(1, args.epochs // 5) == 0:
@@ -305,7 +305,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
                 'args': args
-            }, os.path.join(args.checkpoint_dir, f'improved_epoch_{epoch}.pt'))
+            }, os.path.join(args.checkpoint_dir, f'k_words_epoch_{epoch}.pt'))
     
     print("\nFinal evaluation:")
     evaluate_model(model, dataset, device)
