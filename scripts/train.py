@@ -310,6 +310,45 @@ def main():
     print("\nFinal evaluation:")
     evaluate_model(model, dataset, device)
     print(f"\nTraining complete! Best loss: {best_loss:.4f}")
+    
+    # Extract vocabulary for fast loading
+    print("\n" + "="*60)
+    print("Extracting vocabulary for fast inference...")
+    print("="*60)
+    
+    import pickle
+    vocab_data = {
+        'word_to_idx': dataset.word_to_idx,
+        'idx_to_word': dataset.idx_to_word,
+        'vocab_size': dataset.vocab_size,
+        'k': args.k,
+        'embedding_dim': args.embedding_dim,
+        'hidden_dim': args.hidden_dim,
+        'dropout': args.dropout
+    }
+    
+    vocab_path = os.path.join(args.checkpoint_dir, 'k_words_vocab.pkl')
+    with open(vocab_path, 'wb') as f:
+        pickle.dump(vocab_data, f)
+    
+    print(f"✓ Vocabulary saved to {vocab_path}")
+    print(f"  Vocabulary size: {len(vocab_data['word_to_idx'])} words")
+    print(f"  File size: {os.path.getsize(vocab_path) / 1024 / 1024:.2f} MB")
+    
+    # Also save as text file for inspection
+    words_path = os.path.join(args.checkpoint_dir, 'k_words_vocabulary.txt')
+    with open(words_path, 'w') as f:
+        f.write(f"# K-Words Model Vocabulary\n")
+        f.write(f"# Total words: {len(vocab_data['word_to_idx'])}\n")
+        f.write(f"# Model parameters: k={args.k}, embedding_dim={args.embedding_dim}\n")
+        f.write(f"#" + "="*60 + "\n\n")
+        
+        for idx in range(len(vocab_data['idx_to_word'])):
+            word = vocab_data['idx_to_word'][idx]
+            f.write(f"{idx:5d}: {word}\n")
+    
+    print(f"✓ Word list saved to {words_path}")
+    print("\nInference tools will now load instantly without recreating the dataset!")
 
 
 if __name__ == '__main__':
